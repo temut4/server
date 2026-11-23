@@ -1,0 +1,9 @@
+{
+  "name": "airduel-lobby",
+  "version": "1.0.0",
+  "private": true,
+  "main": "lobby.js",
+  "scripts": { "start": "node lobby.js" },
+  "dependencies": { "ws": "^8.18.0" },
+  "engines": { "node": ">=18" }
+}
