@@ -86,6 +86,7 @@ wss.on('connection', ws => {
     ws.on('pong', () => { ws.isAlive = true; });
 
     clients.set(ws, { id: ++seq, name: 'PILOT', plane: 0, pilot: 0, state: 'idle', peer: null });
+    console.log(`[conn] +1 client, total=${clients.size}, url=${ws.url}`);
     send(ws, { t: 'lobby', ...getStats() });
 
     ws.on('message', data => {
@@ -125,8 +126,14 @@ wss.on('connection', ws => {
         }
     });
 
-    ws.on('close', () => drop(ws));
-    ws.on('error', () => drop(ws));
+    ws.on('close', (code, reason) => {
+        console.log(`[conn] -1 client, code=${code}, total=${Math.max(0, clients.size - 1)}`);
+        drop(ws); broadcastLobby();
+    });
+    ws.on('error', err => {
+        console.log(`[conn] error: ${err.message}`);
+        drop(ws); broadcastLobby();
+    });
 });
 
 // Защита от "мертвых" соединений (обрыв интернета без закрытия сокета)
