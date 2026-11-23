@@ -1,9 +1,9 @@
+// server/lobby.js
 const http = require('http');
 const { WebSocketServer } = require('ws');
-
 const PORT = process.env.PORT || 8899;
 const clients = new Map();
-const queue = []; // Очередь на глобальный матч
+const queue = [];
 let seq = 0;
 
 const send = (ws, o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
@@ -26,22 +26,18 @@ function broadcastLobby() {
 function pair(a, b) {
     const ca = clients.get(a), cb = clients.get(b);
     if (!ca || !cb) return;
-
     ca.state = cb.state = 'play';
     ca.peer = b; cb.peer = a;
 
-    // Чистим очередь
     const ia = queue.indexOf(a); if (ia >= 0) queue.splice(ia, 1);
     const ib = queue.indexOf(b); if (ib >= 0) queue.splice(ib, 1);
 
-    // Тот, кто ждал дольше (a), становится ХОСТОМ
     send(a, { t: 'paired', host: true, opponent: cb.name, plane: cb.plane, pilot: cb.pilot });
     send(b, { t: 'paired', host: false, opponent: ca.name, plane: ca.plane, pilot: ca.pilot });
     console.log(`[MATCH] ${ca.name} (HOST) <-> ${cb.name} (CLIENT)`);
 }
 
 function tryMatch(ws) {
-    // Ищем первого свободного в очереди
     for (let i = 0; i < queue.length; i++) {
         const candidate = queue[i];
         if (candidate !== ws && clients.has(candidate) && clients.get(candidate).state === 'seek') {
@@ -56,17 +52,14 @@ function tryMatch(ws) {
 function drop(ws) {
     const c = clients.get(ws);
     if (!c) return;
-
     const qi = queue.indexOf(ws);
     if (qi >= 0) queue.splice(qi, 1);
 
-    // Уведомляем напарника об обрыве связи
     if (c.peer && clients.has(c.peer)) {
         send(c.peer, { t: 'bye', reason: 'disconnect' });
         const p = clients.get(c.peer);
         if (p) { p.peer = null; p.state = 'idle'; }
     }
-
     clients.delete(ws);
     try { ws.terminate(); } catch (_) {}
     broadcastLobby();
@@ -80,20 +73,16 @@ const server = http.createServer((req, res) => {
 });
 
 const wss = new WebSocketServer({ server });
-
 wss.on('connection', ws => {
     ws.isAlive = true;
     ws.on('pong', () => { ws.isAlive = true; });
-
     clients.set(ws, { id: ++seq, name: 'PILOT', plane: 0, pilot: 0, state: 'idle', peer: null });
-    console.log(`[conn] +1 client, total=${clients.size}, url=${ws.url}`);
     send(ws, { t: 'lobby', ...getStats() });
 
     ws.on('message', data => {
         const s = data.toString();
         let o;
         try { o = JSON.parse(s); } catch (_) { return; }
-
         const c = clients.get(ws);
         if (!c) return;
 
@@ -102,7 +91,6 @@ wss.on('connection', ws => {
             c.plane = Math.max(0, Math.min(9, o.pl | 0));
             c.pilot = Math.max(0, Math.min(14, o.pi | 0));
             c.state = 'seek';
-
             if (!tryMatch(ws)) {
                 if (!queue.includes(ws)) queue.push(ws);
                 send(ws, { t: 'waiting', pos: queue.indexOf(ws) + 1, ...getStats() });
@@ -120,23 +108,15 @@ wss.on('connection', ws => {
             return;
         }
 
-        // РЕТРАНСЛЯЦИЯ: Все остальные пакеты (hello, start, i, s, bye) летят напарнику
         if (c.peer && clients.has(c.peer)) {
             raw(c.peer, s);
         }
     });
 
-    ws.on('close', (code, reason) => {
-        console.log(`[conn] -1 client, code=${code}, total=${Math.max(0, clients.size - 1)}`);
-        drop(ws); broadcastLobby();
-    });
-    ws.on('error', err => {
-        console.log(`[conn] error: ${err.message}`);
-        drop(ws); broadcastLobby();
-    });
+    ws.on('close', () => drop(ws));
+    ws.on('error', () => drop(ws));
 });
 
-// Защита от "мертвых" соединений (обрыв интернета без закрытия сокета)
 setInterval(() => {
     for (const ws of wss.clients) {
         if (ws.isAlive === false) { drop(ws); continue; }
