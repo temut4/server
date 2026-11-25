@@ -1,129 +1,88 @@
-// server/lobby.js
-const http = require('http');
+// Минималистичный лобби-сервер: принимает WS-соединения, спаривает по 2 и ретранслирует.
 const { WebSocketServer } = require('ws');
-const PORT = process.env.PORT || 8899;
-const clients = new Map();
-const queue = [];
-let seq = 0;
+const http = require('http');
 
-const send = (ws, o) => { if (ws && ws.readyState === 1) ws.send(JSON.stringify(o)); };
-const raw = (ws, s) => { if (ws && ws.readyState === 1) ws.send(s); };
-
-function getStats() {
-    let seeking = 0, playing = 0;
-    for (const c of clients.values()) {
-        if (c.state === 'seek') seeking++;
-        if (c.state === 'play') playing++;
-    }
-    return { online: clients.size, seeking, playing };
-}
-
-function broadcastLobby() {
-    const m = JSON.stringify({ t: 'lobby', ...getStats() });
-    for (const ws of clients.keys()) raw(ws, m);
-}
-
-function pair(a, b) {
-    const ca = clients.get(a), cb = clients.get(b);
-    if (!ca || !cb) return;
-    ca.state = cb.state = 'play';
-    ca.peer = b; cb.peer = a;
-
-    const ia = queue.indexOf(a); if (ia >= 0) queue.splice(ia, 1);
-    const ib = queue.indexOf(b); if (ib >= 0) queue.splice(ib, 1);
-
-    send(a, { t: 'paired', host: true, opponent: cb.name, plane: cb.plane, pilot: cb.pilot });
-    send(b, { t: 'paired', host: false, opponent: ca.name, plane: ca.plane, pilot: ca.pilot });
-    console.log(`[MATCH] ${ca.name} (HOST) <-> ${cb.name} (CLIENT)`);
-}
-
-function tryMatch(ws) {
-    for (let i = 0; i < queue.length; i++) {
-        const candidate = queue[i];
-        if (candidate !== ws && clients.has(candidate) && clients.get(candidate).state === 'seek') {
-            queue.splice(i, 1);
-            pair(candidate, ws);
-            return true;
-        }
-    }
-    return false;
-}
-
-function drop(ws) {
-    const c = clients.get(ws);
-    if (!c) return;
-    const qi = queue.indexOf(ws);
-    if (qi >= 0) queue.splice(qi, 1);
-
-    if (c.peer && clients.has(c.peer)) {
-        send(c.peer, { t: 'bye', reason: 'disconnect' });
-        const p = clients.get(c.peer);
-        if (p) { p.peer = null; p.state = 'idle'; }
-    }
-    clients.delete(ws);
-    try { ws.terminate(); } catch (_) {}
-    broadcastLobby();
-}
-
+const PORT = process.env.PORT || 8080;
 const server = http.createServer((req, res) => {
-    res.setHeader('content-type', 'application/json; charset=utf-8');
-    res.setHeader('access-control-allow-origin', '*');
-    if (req.url === '/health') { res.writeHead(200); res.end('{"ok":true}'); return; }
-    res.writeHead(200); res.end(JSON.stringify({ service: 'airduel-global-lobby', ...getStats() }, null, 2));
+  if (req.url === '/health') { res.writeHead(200); res.end('ok'); return; }
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end('airduel lobby · waiting:' + waiting.length + ' · pairs:' + pairs.size);
 });
 
 const wss = new WebSocketServer({ server });
-wss.on('connection', ws => {
-    ws.isAlive = true;
-    ws.on('pong', () => { ws.isAlive = true; });
-    clients.set(ws, { id: ++seq, name: 'PILOT', plane: 0, pilot: 0, state: 'idle', peer: null });
-    send(ws, { t: 'lobby', ...getStats() });
+const waiting = [];        // массив {ws, info} ждущих одиночных игроков
+const pairs = new Map();   // ws -> {peer: ws, info}
 
-    ws.on('message', data => {
-        const s = data.toString();
-        let o;
-        try { o = JSON.parse(s); } catch (_) { return; }
-        const c = clients.get(ws);
-        if (!c) return;
+function broadcastWaiting() {
+  const msg = JSON.stringify({ t: 'waiting', count: waiting.length, pairs: pairs.size });
+  for (const w of waiting) try { w.ws.send(msg); } catch (_) {}
+  for (const p of pairs.values()) try { p.peer.send(msg); } catch (_) {}
+}
 
-        if (o.t === 'seek') {
-            c.name = String(o.n || 'PILOT').slice(0, 10);
-            c.plane = Math.max(0, Math.min(9, o.pl | 0));
-            c.pilot = Math.max(0, Math.min(14, o.pi | 0));
-            c.state = 'seek';
-            if (!tryMatch(ws)) {
-                if (!queue.includes(ws)) queue.push(ws);
-                send(ws, { t: 'waiting', pos: queue.indexOf(ws) + 1, ...getStats() });
-            }
-            broadcastLobby();
-            return;
-        }
+function makePair(a, b) {
+  const pair = { a, b };
+  pairs.set(a.ws, { peer: b.ws, info: b.info });
+  pairs.set(b.ws, { peer: a.ws, info: a.info });
+  // сообщаем обоим, что они спарены
+  a.ws.send(JSON.stringify({ t: 'matched', role: 'host', opponent: b.info }));
+  b.ws.send(JSON.stringify({ t: 'matched', role: 'guest', opponent: a.info }));
+  broadcastWaiting();
+}
 
-        if (o.t === 'cancel') {
-            const qi = queue.indexOf(ws);
-            if (qi >= 0) queue.splice(qi, 1);
-            c.state = 'idle';
-            send(ws, { t: 'cancelled' });
-            broadcastLobby();
-            return;
-        }
+wss.on('connection', (ws) => {
+  let myInfo = null;
 
-        if (c.peer && clients.has(c.peer)) {
-            raw(c.peer, s);
-        }
-    });
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw.toString()); } catch (_) { return; }
 
-    ws.on('close', () => drop(ws));
-    ws.on('error', () => drop(ws));
+    // регистрация в очереди
+    if (msg.t === 'seek') {
+      myInfo = { n: (msg.n || 'PILOT').slice(0, 10), pl: msg.pl | 0, pi: msg.pi | 0 };
+      // есть ли свободный?
+      const other = waiting.shift();
+      if (other) {
+        makePair(other, { ws, info: myInfo });
+      } else {
+        waiting.push({ ws, info: myInfo });
+        ws.send(JSON.stringify({ t: 'waiting', pos: waiting.length, count: waiting.length }));
+        broadcastWaiting();
+      }
+      return;
+    }
+
+    // отмена ожидания
+    if (msg.t === 'cancel') {
+      const idx = waiting.findIndex(w => w.ws === ws);
+      if (idx >= 0) waiting.splice(idx, 1);
+      pairs.delete(ws);
+      broadcastWaiting();
+      return;
+    }
+
+    // игровые пакеты: ретранслируем партнёру
+    const pair = pairs.get(ws);
+    if (pair) {
+      try { pair.peer.send(raw.toString()); } catch (_) {}
+    }
+  });
+
+  ws.on('close', () => {
+    const idx = waiting.findIndex(w => w.ws === ws);
+    if (idx >= 0) waiting.splice(idx, 1);
+    const pair = pairs.get(ws);
+    if (pair) {
+      pairs.delete(ws);
+      // уведомить партнёра
+      try { pair.peer.send(JSON.stringify({ t: 'bye' })); } catch (_) {}
+      // разорвать вторую сторону
+      try { pair.peer.close(); } catch (_) {}
+      pairs.delete(pair.peer);
+    }
+    broadcastWaiting();
+  });
+
+  ws.on('error', () => {});
 });
 
-setInterval(() => {
-    for (const ws of wss.clients) {
-        if (ws.isAlive === false) { drop(ws); continue; }
-        ws.isAlive = false;
-        try { ws.ping(); } catch (_) {}
-    }
-}, 15000);
-
-setInterval(broadcastLobby, 3000);
-server.listen(PORT, () => console.log(`[AIR DUEL LOBBY] Listening on port ${PORT}`));
+server.listen(PORT, () => console.log('lobby on :' + PORT));
